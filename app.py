@@ -20,6 +20,10 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 from silero_vad import get_speech_timestamps, load_silero_vad, read_audio
 
+# ---------- 环境变量配置 ----------
+
+ENABLE_DOCS = os.environ.get("ENABLE_DOCS", "false").lower() in ("true", "1", "yes")
+
 # ---------- 全局加载模型（启动时加载一次） ----------
 
 print("正在加载 Silero VAD 模型...")
@@ -30,6 +34,8 @@ app = FastAPI(
     title="VAD Label API",
     description="基于 Silero VAD 的语音活动检测打标服务",
     version="1.0.0",
+    docs_url="/docs" if ENABLE_DOCS else None,
+    redoc_url="/redoc" if ENABLE_DOCS else None,
 )
 
 # 支持的音频扩展名
@@ -44,15 +50,33 @@ def do_detect(
     min_speech_duration_ms: int = 250,
     min_silence_duration_ms: int = 100,
     window_size_samples: int = 512,
-    normalize: bool = True,
+    normalize: str = "simple",
+    clip_threshold: float = 0.3,
+    gate_threshold: float = 0.05,
 ) -> list[dict]:
-    """执行 VAD 检测，返回语音片段列表"""
+    """执行 VAD 检测，返回语音片段列表
+
+    normalize 模式:
+        - "off":    不做任何处理
+        - "simple": 仅归一化（峰值低于0.5时放大到1.0）
+        - "full":   限幅→归一化→噪声门（适合低音量人声+突发噪声场景）
+    """
     wav = read_audio(audio_path)
 
-    if normalize:
+    if normalize == "simple":
         max_val = wav.abs().max()
         if max_val > 0 and max_val < 0.5:
             wav = wav / max_val
+
+    elif normalize == "full":
+        # 1. 限幅：截断突发尖峰（如喇叭声）
+        wav = wav.clamp(-clip_threshold, clip_threshold)
+        # 2. 归一化：放大整体音量
+        max_val = wav.abs().max()
+        if max_val > 0:
+            wav = wav / max_val
+        # 3. 噪声门：抑制低于门限的持续噪音
+        wav = wav * (wav.abs() > gate_threshold).float()
 
     speech_timestamps = get_speech_timestamps(
         wav,
@@ -91,7 +115,9 @@ async def detect_vad(
     min_speech: int = Query(250, ge=0, description="最小语音时长 (毫秒)"),
     min_silence: int = Query(100, ge=0, description="最小静音时长 (毫秒)"),
     window: int = Query(512, description="窗口大小 (采样点数)"),
-    normalize: bool = Query(True, description="是否自动归一化低音量音频"),
+    normalize: str = Query("simple", description="归一化模式: off / simple / full"),
+    clip_threshold: float = Query(0.3, ge=0.0, le=1.0, description="限幅阈值 (full模式生效，截断尖峰)"),
+    gate_threshold: float = Query(0.05, ge=0.0, le=1.0, description="噪声门阈值 (full模式生效，抑制低音量噪音)"),
     format: str = Query("json", description="输出格式: json / text / csv / srt"),
 ):
     """
@@ -102,7 +128,12 @@ async def detect_vad(
     - **min_speech**: 最小语音片段时长(ms)，默认 250
     - **min_silence**: 最小静音时长(ms)，默认 100
     - **window**: 窗口采样点数，默认 512
-    - **normalize**: 自动归一化低音量音频，默认开启
+    - **normalize**: 归一化模式，默认 simple
+        - off: 不做任何处理
+        - simple: 仅归一化（峰值低于0.5时放大到1.0）
+        - full: 限幅→归一化→噪声门（适合低音量人声+突发噪声）
+    - **clip_threshold**: 限幅阈值 (full模式)，默认 0.3
+    - **gate_threshold**: 噪声门阈值 (full模式)，默认 0.05
     - **format**: 返回格式 json/text/csv/srt，默认 json
     """
     # 校验文件扩展名
@@ -129,6 +160,8 @@ async def detect_vad(
             min_silence_duration_ms=min_silence,
             window_size_samples=window,
             normalize=normalize,
+            clip_threshold=clip_threshold,
+            gate_threshold=gate_threshold,
         )
 
         # 按格式返回

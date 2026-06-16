@@ -7,11 +7,12 @@
 ## 功能特性
 
 - 基于企业级预训练模型 Silero VAD，检测精度高
-- 自动归一化低音量音频，无需手动调整
+- 三种归一化模式：off / simple / full，适应不同录音环境
 - 支持 4 种输出格式：JSON / Text / CSV / SRT
 - 提供 REST API，便于集成到其他系统
 - 支持 Docker 一键部署
 - CPU 即可运行，无需 GPU
+- 交互式 API 文档可通过环境变量控制开关
 
 ## 项目结构
 
@@ -35,7 +36,7 @@ vad/
 pip3 install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 
 # 安装 silero-vad 及其他依赖
-pip3 install silero-vad
+pip3 install silero-vad numpy soundfile
 
 # 系统需要安装 ffmpeg（用于 mp3 解码）
 # macOS:
@@ -67,9 +68,11 @@ python3 vad_label.py <音频文件> [选项]
 | `--min-speech` | `-s` | 250 | 最小语音时长（毫秒） |
 | `--min-silence` | `-S` | 100 | 最小静音时长（毫秒） |
 | `--window` | `-w` | 512 | 窗口大小（采样点数） |
+| `--normalize` | `-n` | simple | 归一化模式：off / simple / full |
+| `--clip-threshold` | — | 0.3 | 限幅阈值（full 模式生效） |
+| `--gate-threshold` | — | 0.05 | 噪声门阈值（full 模式生效） |
 | `--format` | `-f` | text | 输出格式：text / json / csv / srt |
 | `--output` | `-o` | — | 输出文件路径（默认输出到终端） |
-| `--no-normalize` | — | false | 禁用自动归一化 |
 
 ### 使用示例
 
@@ -89,11 +92,14 @@ python3 vad_label.py input.mp3 -f csv
 # SRT 字幕格式（可在播放器中可视化查看 VAD 区域）
 python3 vad_label.py input.mp3 -f srt -o vad.srt
 
-# 调整检测参数
-python3 vad_label.py input.mp3 -t 0.6 -s 300 -S 150
+# 禁用归一化
+python3 vad_label.py input.mp3 -n off
 
-# 禁用自动归一化
-python3 vad_label.py input.mp3 --no-normalize
+# 完整归一化模式（低音量人声+突发噪声场景）
+python3 vad_label.py input.mp3 -n full -t 0.15
+
+# 完整归一化模式，自定义限幅和噪声门参数
+python3 vad_label.py input.mp3 -n full --clip-threshold 0.2 --gate-threshold 0.03
 ```
 
 ### 输出格式示例
@@ -161,14 +167,15 @@ segment_id,start_sec,end_sec,duration_sec,start_fmt,end_fmt
 
 ```bash
 # 构建镜像
-podman build -t vad-api .
+podman build -f dockerfile -t silero-vad-api:v1.0.0 .
 # 或使用 docker
-docker build -t vad-api .
+docker build -f dockerfile -t silero-vad-api:v1.0.0 .
 
-# 运行容器
-podman run -d -p 8000:8000 --name vad-api vad-api
-# 或使用 docker
-docker run -d -p 8000:8000 --name vad-api vad-api
+# 运行容器（默认关闭 API 文档）
+podman run -d -p 8000:8000 --name vad-api silero-vad-api:v1.0.0
+
+# 运行容器（开启 API 文档，用于开发调试）
+podman run -d -p 8000:8000 -e ENABLE_DOCS=true --name vad-api silero-vad-api:v1.0.0
 ```
 
 ### 本地直接启动
@@ -178,7 +185,7 @@ pip3 install -r requirements.txt --index-url https://download.pytorch.org/whl/cp
 uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
-启动后访问交互式 API 文档：`http://localhost:8000/docs`
+开启 API 文档后访问：`http://localhost:8000/docs`
 
 ### API 接口
 
@@ -209,7 +216,9 @@ POST /vad
 | `min_speech` | query | int | 250 | 最小语音时长（毫秒） |
 | `min_silence` | query | int | 100 | 最小静音时长（毫秒） |
 | `window` | query | int | 512 | 窗口采样点数 |
-| `normalize` | query | bool | true | 自动归一化低音量音频 |
+| `normalize` | query | string | simple | 归一化模式：off / simple / full |
+| `clip_threshold` | query | float | 0.3 | 限幅阈值（full 模式生效） |
+| `gate_threshold` | query | float | 0.05 | 噪声门阈值（full 模式生效） |
 | `format` | query | string | json | 输出格式：json / text / csv / srt |
 
 **调用示例**：
@@ -232,7 +241,15 @@ curl -X POST 'http://localhost:8000/vad?format=srt' \
   -F 'file=@input.mp3' -o vad.srt
 
 # 禁用归一化
-curl -X POST 'http://localhost:8000/vad?normalize=false' \
+curl -X POST 'http://localhost:8000/vad?normalize=off' \
+  -F 'file=@input.mp3'
+
+# 完整归一化模式（低音量人声+突发噪声场景）
+curl -X POST 'http://localhost:8000/vad?normalize=full&threshold=0.15' \
+  -F 'file=@input.mp3'
+
+# 完整归一化模式，自定义限幅和噪声门参数
+curl -X POST 'http://localhost:8000/vad?normalize=full&clip_threshold=0.2&gate_threshold=0.03&threshold=0.15' \
   -F 'file=@input.mp3'
 ```
 
@@ -263,6 +280,71 @@ curl -X POST 'http://localhost:8000/vad?normalize=false' \
 {"detail": "VAD 检测失败: ..."}
 ```
 
+### 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `ENABLE_DOCS` | false | 是否开启 API 文档（/docs, /redoc），设为 `true` 开启 |
+
+---
+
+## 归一化模式详解
+
+### off — 不处理
+
+不对音频做任何处理，直接送入 VAD 模型。适用于音量正常的录音。
+
+### simple — 简单归一化（默认）
+
+当音频峰值振幅低于 0.5 时，自动将振幅缩放到 1.0。适用于低音量录音。
+
+```python
+max_val = wav.abs().max()
+if max_val > 0 and max_val < 0.5:
+    wav = wav / max_val
+```
+
+**原理**：所有采样点除以峰值，波形形状不变，只是音量被放大。
+
+### full — 完整处理（限幅→归一化→噪声门）
+
+三步串联处理，适用于**低音量人声 + 突发高音量噪声**的场景（如户外录音中的汽车喇叭声）。
+
+**第 1 步：限幅（Clipping）** — 截断突发尖峰
+
+```python
+wav = wav.clamp(-clip_threshold, clip_threshold)  # 默认 ±0.3
+```
+
+喇叭声等尖峰振幅可达 0.8~1.0，截断到 0.3 后被大幅削弱，而原本 0.04 的人声不受影响。
+
+**第 2 步：归一化（Normalization）** — 放大整体音量
+
+```python
+max_val = wav.abs().max()
+if max_val > 0:
+    wav = wav / max_val
+```
+
+限幅后峰值变为 0.3，归一化后人声从 0.04 被放大到约 0.13。
+
+**第 3 步：噪声门（Noise Gate）** — 抑制持续低音量噪音
+
+```python
+wav = wav * (wav.abs() > gate_threshold).float()  # 默认 0.05
+```
+
+归一化后低于门限的环境噪声直接置零，人声片段保留。
+
+**full 模式参数**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `clip_threshold` | 0.3 | 限幅阈值，超出此值的采样点被截断。值越小对尖峰压制越强 |
+| `gate_threshold` | 0.05 | 噪声门阈值，归一化后低于此值的采样点被置零。值越大过滤越激进 |
+
+> **处理顺序很重要**：必须先限幅再归一化，否则归一化会放大尖峰；噪声门最后执行，在归一化后的音量基础上过滤。
+
 ---
 
 ## 参数调优指南
@@ -276,9 +358,7 @@ curl -X POST 'http://localhost:8000/vad?normalize=false' \
 | 安静环境录音 | 0.5（默认） | 标准灵敏度 |
 | 有背景噪声 | 0.6 - 0.7 | 提高阈值过滤噪声 |
 | 低音量录音 | 0.2 - 0.3 | 降低阈值捕捉更多语音 |
-| 精确检测 | 0.5 - 0.6 | 平衡误检和漏检 |
-
-> 对于低音量音频，工具会自动归一化（将振幅放大到 1.0），因此通常只需降低阈值即可。
+| full 模式下 | 0.1 - 0.2 | 归一化后人声仍较弱，需更低阈值 |
 
 ### min_speech（最小语音时长）
 
@@ -292,13 +372,13 @@ curl -X POST 'http://localhost:8000/vad?normalize=false' \
 - 如果语音中有短暂停顿不应被切分，提高至 200-300ms
 - 如果需要精确捕捉每个语音起止点，保持默认
 
-### 自动归一化
+### 归一化模式选择
 
-当音频最大振幅低于 0.5 时，自动将振幅缩放到 1.0。适用于：
-- 录音音量过低的文件
-- 远场麦克风录制的音频
-
-如确认音频音量正常且不希望修改原始数据，可通过 `--no-normalize`（命令行）或 `normalize=false`（API）关闭。
+| 场景 | 推荐模式 | 说明 |
+|------|----------|------|
+| 音量正常的录音 | off | 无需处理 |
+| 低音量录音 | simple | 自动放大到合理音量 |
+| 低音量人声+突发噪声 | full + 低阈值 | 限幅压制尖峰，归一化放大人声，噪声门过滤背景 |
 
 ---
 
@@ -307,7 +387,7 @@ curl -X POST 'http://localhost:8000/vad?normalize=false' \
 - **VAD 模型**：Silero VAD v6，基于 PyTorch JIT，模型大小约 2MB
 - **采样率**：Silero VAD 支持 8000Hz 和 16000Hz，`read_audio` 会自动重采样
 - **处理速度**：30ms 音频片段处理耗时 < 1ms（CPU），600 秒音频约 3 秒完成检测
-- **音频后端**：优先使用 ffmpeg 解码（支持 mp3 等格式），也支持 soundfile（仅 wav/flac）
+- **音频后端**：通过 soundfile 读取音频，系统 ffmpeg 用于 mp3 解码支持
 
 ---
 
@@ -318,6 +398,8 @@ curl -X POST 'http://localhost:8000/vad?normalize=false' \
 | `silero-vad` | VAD 模型加载与推理 |
 | `torch` | PyTorch 运行时（CPU 版即可） |
 | `torchaudio` | 音频文件读取与重采样 |
+| `numpy` | PyTorch 内部依赖，torchaudio 后端需要 |
+| `soundfile` | torchaudio 的音频 I/O 后端 |
 | `fastapi` | Web API 框架 |
 | `uvicorn` | ASGI 服务器 |
 | `python-multipart` | 文件上传支持 |

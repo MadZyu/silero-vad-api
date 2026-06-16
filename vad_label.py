@@ -37,7 +37,9 @@ def detect_vad(
     min_speech_duration_ms: int = 250,
     min_silence_duration_ms: int = 100,
     window_size_samples: int = 512,
-    normalize: bool = True,
+    normalize: str = "simple",
+    clip_threshold: float = 0.3,
+    gate_threshold: float = 0.05,
 ) -> list[dict]:
     """
     对音频文件执行 VAD 检测，返回语音片段的时间戳列表。
@@ -48,7 +50,9 @@ def detect_vad(
         min_speech_duration_ms: 最小语音时长 (毫秒)
         min_silence_duration_ms: 最小静音时长 (毫秒)
         window_size_samples: 窗口大小 (采样点数)
-        normalize: 是否对音频进行归一化 (音量放大到合理范围)
+        normalize: 归一化模式 - off/simple/full
+        clip_threshold: 限幅阈值 (full模式生效)
+        gate_threshold: 噪声门阈值 (full模式生效)
 
     Returns:
         语音片段列表，每项包含 start 和 end 时间 (秒)
@@ -56,10 +60,20 @@ def detect_vad(
     model = load_silero_vad()
     wav = read_audio(audio_path)
 
-    if normalize:
+    if normalize == "simple":
         max_val = wav.abs().max()
         if max_val > 0 and max_val < 0.5:
             wav = wav / max_val
+
+    elif normalize == "full":
+        # 1. 限幅：截断突发尖峰（如喇叭声）
+        wav = wav.clamp(-clip_threshold, clip_threshold)
+        # 2. 归一化：放大整体音量
+        max_val = wav.abs().max()
+        if max_val > 0:
+            wav = wav / max_val
+        # 3. 噪声门：抑制低于门限的持续噪音
+        wav = wav * (wav.abs() > gate_threshold).float()
 
     speech_timestamps = get_speech_timestamps(
         wav,
@@ -181,9 +195,20 @@ def main():
     )
 
     parser.add_argument(
-        "--no-normalize",
-        action="store_true",
-        help="禁用音频归一化 (默认自动归一化低音量音频)",
+        "--normalize", "-n",
+        choices=["off", "simple", "full"],
+        default="simple",
+        help="归一化模式 (默认: simple): off=不处理, simple=仅归一化, full=限幅+归一化+噪声门",
+    )
+    parser.add_argument(
+        "--clip-threshold",
+        type=float, default=0.3,
+        help="限幅阈值 (full模式生效，默认: 0.3)",
+    )
+    parser.add_argument(
+        "--gate-threshold",
+        type=float, default=0.05,
+        help="噪声门阈值 (full模式生效，默认: 0.05)",
     )
 
     args = parser.parse_args()
@@ -203,7 +228,9 @@ def main():
             min_speech_duration_ms=args.min_speech,
             min_silence_duration_ms=args.min_silence,
             window_size_samples=args.window,
-            normalize=not args.no_normalize,
+            normalize=args.normalize,
+            clip_threshold=args.clip_threshold,
+            gate_threshold=args.gate_threshold,
         )
     except Exception as e:
         print(f"错误: VAD 检测失败: {e}", file=sys.stderr)
