@@ -16,6 +16,7 @@ import os
 import tempfile
 import uuid
 
+import numpy as np
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 from silero_vad import get_speech_timestamps, load_silero_vad, read_audio
@@ -224,5 +225,191 @@ async def detect_vad(
         raise HTTPException(status_code=500, detail=f"VAD 检测失败: {str(e)}")
     finally:
         # 清理临时文件
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+# ---------- VAD v2: 自动预处理 + RNNoise 降噪 + VAD 检测 ----------
+
+def _do_vad_v2(
+    audio_path: str,
+    threshold: float = 0.08,
+    min_speech_duration_ms: int = 300,
+    min_silence_duration_ms: int = 100,
+    window_size_samples: int = 512,
+    target_rms: float = 0.15,
+    normalize_output: bool = True,
+) -> tuple[list[dict], dict]:
+    """
+    自动预处理 + RNNoise 降噪 + VAD 检测流程
+
+    返回: (speech_timestamps, preprocess_info)
+    """
+    from rnnoise_denoise import analyze_audio, auto_preprocess, rnnoise_denoise
+
+    wav = read_audio(audio_path)
+    wav_np = wav.numpy()
+
+    # 1. 分析音频特征
+    info = analyze_audio(wav_np)
+
+    # 2. 自适应预处理: 增益 + tanh 软限幅
+    processed, params = auto_preprocess(wav_np, target_rms=target_rms)
+
+    # 3. RNNoise 降噪
+    denoised = rnnoise_denoise(processed, normalize_output=normalize_output)
+
+    # 4. VAD 检测
+    denoised_tensor = __import__("torch").FloatTensor(denoised)
+    speech_timestamps = get_speech_timestamps(
+        denoised_tensor,
+        _model,
+        threshold=threshold,
+        min_speech_duration_ms=min_speech_duration_ms,
+        min_silence_duration_ms=min_silence_duration_ms,
+        window_size_samples=window_size_samples,
+        return_seconds=True,
+    )
+
+    # 预处理信息汇总
+    preprocess_info = {
+        "original": {
+            "peak": round(float(info["peak"]), 6),
+            "rms": round(float(info["rms"]), 6),
+            "duration_sec": round(len(wav_np) / 16000, 2),
+        },
+        "preprocess": {
+            "gain": round(float(params["gain"]), 1),
+            "clip_threshold": round(float(params["clip_threshold"]), 4),
+            "target_rms": target_rms,
+        },
+        "denoised": {
+            "peak": round(float(np.abs(denoised).max()), 6),
+            "rms": round(float(np.sqrt(np.mean(denoised**2))), 6),
+            "normalized": normalize_output,
+        },
+    }
+
+    return speech_timestamps, preprocess_info
+
+
+@app.post("/vad/v2")
+async def detect_vad_v2(
+    file: UploadFile = File(..., description="音频文件 (mp3/wav/flac/ogg/m4a 等)"),
+    threshold: float = Query(0.08, ge=0.0, le=1.0, description="VAD 阈值 (0.0-1.0)，默认 0.08（v2 适合低阈值）"),
+    min_speech: int = Query(300, ge=0, description="最小语音时长 (毫秒)，默认 300"),
+    min_silence: int = Query(100, ge=0, description="最小静音时长 (毫秒)，默认 100"),
+    window: int = Query(512, description="窗口大小 (采样点数)，默认 512"),
+    target_rms: float = Query(0.15, ge=0.01, le=0.5, description="预处理目标 RMS，默认 0.15"),
+    normalize_output: bool = Query(True, description="降噪后是否归一化到峰值 1.0"),
+    format: str = Query("json", description="输出格式: json / text / csv / srt"),
+):
+    """
+    VAD v2: 自动预处理 + RNNoise 降噪 + VAD 检测
+
+    相比 /vad 接口，v2 在检测前增加了:
+    1. **自适应增益**: 将音频 RMS 提升到 target_rms，让 RNNoise 在正常音量下工作
+    2. **tanh 软限幅**: 压制突发尖峰（关门声、喇叭声等）
+    3. **RNNoise 降噪**: 基于 RNN 的实时降噪
+
+    适合场景: 低音量录音、有突发噪声干扰的环境录音
+
+    - **file**: 音频文件
+    - **threshold**: VAD 阈值，v2 默认 0.08（比 v1 的 0.5 更低，因降噪后信号更干净）
+    - **target_rms**: 预处理后目标 RMS，默认 0.15
+      - 越大: 增益越高，可能引入更多噪声
+      - 越小: 增益较低，可能无法有效提升低音量信号
+    - **normalize_output**: 降噪后归一化，默认 True
+    - **format**: 返回格式 json/text/csv/srt，默认 json
+    """
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的文件格式: {ext}，支持: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+        )
+
+    tmp_dir = tempfile.gettempdir()
+    tmp_path = os.path.join(tmp_dir, f"vadv2_{uuid.uuid4().hex}{ext}")
+    try:
+        content = await file.read()
+        with open(tmp_path, "wb") as f:
+            f.write(content)
+
+        speech_timestamps, preprocess_info = _do_vad_v2(
+            tmp_path,
+            threshold=threshold,
+            min_speech_duration_ms=min_speech,
+            min_silence_duration_ms=min_silence,
+            window_size_samples=window,
+            target_rms=target_rms,
+            normalize_output=normalize_output,
+        )
+
+        if format == "json":
+            total_speech = sum(s["end"] - s["start"] for s in speech_timestamps)
+            result = {
+                "file": file.filename,
+                "total_segments": len(speech_timestamps),
+                "total_speech_sec": round(total_speech, 3),
+                "segments": speech_timestamps,
+                "preprocess": preprocess_info,
+            }
+            return JSONResponse(content=result)
+
+        elif format == "text":
+            lines = [
+                f"文件: {file.filename}",
+                f"预处理: 增益={preprocess_info['preprocess']['gain']}x, "
+                f"软限幅={preprocess_info['preprocess']['clip_threshold']}",
+                f"检测到 {len(speech_timestamps)} 个语音片段:",
+                "",
+            ]
+            for i, seg in enumerate(speech_timestamps, 1):
+                dur = seg["end"] - seg["start"]
+                lines.append(
+                    f"  [{i:03d}] {format_time(seg['start'])} -> {format_time(seg['end'])}  "
+                    f"(时长: {dur:.3f}s)"
+                )
+            total_speech = sum(s["end"] - s["start"] for s in speech_timestamps)
+            lines.append("")
+            lines.append(f"总语音时长: {total_speech:.3f}s")
+            return PlainTextResponse(content="\n".join(lines))
+
+        elif format == "csv":
+            lines = ["segment_id,start_sec,end_sec,duration_sec,start_fmt,end_fmt"]
+            for i, seg in enumerate(speech_timestamps, 1):
+                dur = seg["end"] - seg["start"]
+                lines.append(
+                    f"{i},{seg['start']:.3f},{seg['end']:.3f},{dur:.3f},"
+                    f"{format_time(seg['start'])},{format_time(seg['end'])}"
+                )
+            return PlainTextResponse(content="\n".join(lines), media_type="text/csv")
+
+        elif format == "srt":
+            lines = []
+            for i, seg in enumerate(speech_timestamps, 1):
+                sh = int(seg["start"] // 3600)
+                sm = int((seg["start"] % 3600) // 60)
+                ss = int(seg["start"] % 60)
+                sms = int(seg["start"] % 1 * 1000)
+                eh = int(seg["end"] // 3600)
+                em = int((seg["end"] % 3600) // 60)
+                es = int(seg["end"] % 60)
+                ems = int(seg["end"] % 1 * 1000)
+                lines.append(str(i))
+                lines.append(f"{sh:02d}:{sm:02d}:{ss:02d},{sms:03d} --> {eh:02d}:{em:02d}:{es:02d},{ems:03d}")
+                lines.append(f"[VAD] {seg['start']:.3f}s - {seg['end']:.3f}s")
+                lines.append("")
+            return PlainTextResponse(content="\n".join(lines), media_type="text/srt")
+
+        else:
+            raise HTTPException(status_code=400, detail=f"不支持的格式: {format}")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"VAD v2 检测失败: {str(e)}")
+    finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
